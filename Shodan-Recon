@@ -1,0 +1,194 @@
+"""
+SHODAN STUDENT / ACADEMIC API COMPATIBILITY
+
+This application is designed to comply with the limitations of the
+Shodan Student / Academic API tier.
+
+Data scope is intentionally minimal for academic clarity:
+- Organization name
+- IP address
+- CVE identifier
+- CVSS score and severity
+
+The system demonstrates passive vulnerability intelligence gathering
+and visualization techniques suitable for cybersecurity coursework,
+research, and assessment.
+
+Requirements:
+-pip install streamlit shodan pandas plotly requests
+- A valid Shodan Student / Academic API key
+- run with: streamlit run shodanrecon25056916.py
+
+Written by: Muhammad Afif Adli bin Tajudin 
+Date: 14 December 2025
+"""
+
+
+import shodan
+import sqlite3
+import requests
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from datetime import datetime
+import time
+
+# --- CONFIGURATION ---
+DB_NAME = "cve_monitor.db"
+
+# ===========================
+# Scanner Logic
+# ===========================
+class Scanner:
+    def __init__(self, api_key):
+        self.api = shodan.Shodan(api_key)
+        self._init_db()
+
+    def _init_db(self):
+        """Initializes the DB and enables WAL mode for concurrent access."""
+        with sqlite3.connect(DB_NAME) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;") # Enables concurrent reading/writing
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cve_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    org TEXT,
+                    ip TEXT,
+                    cve_id TEXT,
+                    score REAL,
+                    severity TEXT,
+                    timestamp DATETIME
+                )
+            """)
+
+    def get_cve_details(self, cve_id):
+        """Fast lookup via Shodan CVEDB instead of the slow NVD API."""
+        try:
+            r = requests.get(f"https://cvedb.shodan.io/cve/{cve_id}", timeout=5)
+            if r.status_code == 200:
+                score = r.json().get("cvss", 0.0)
+                # Map score to severity (Added severity field to DB)
+                if score >= 9.0: sev = "CRITICAL"
+                elif score >= 7.0: sev = "HIGH"
+                elif score >= 4.0: sev = "MEDIUM"
+                else: sev = "LOW"
+                return score, sev
+        except: pass
+        return 0.0, "UNKNOWN"
+
+    def scan(self, query="country:MY", progress=None):
+        try:
+            results = self.api.search(query, limit=50) # Reduced limit for safer testing
+        except Exception as e:
+            st.error(f"Shodan API Error: {e}. Check your API key or query.")
+            return 0
+        
+        matches = results.get("matches", [])
+        total = len(matches)
+        rows = []
+
+        for i, m in enumerate(matches):
+            org = m.get("org", "Unknown")
+            ip = m.get("ip_str")
+            # Shodan's 'vulns' field is a dictionary where keys are CVE IDs.
+            vulns = m.get("vulns") 
+
+            if vulns:
+                # Convert dict_keys to a list before slicing
+                cve_keys = list(vulns.keys())
+                for cve in cve_keys[:3]: # Limit to top 3 for speed
+                    score, sev = self.get_cve_details(cve)
+                    rows.append((org, ip, cve, score, sev, datetime.now()))
+            
+            if progress: 
+                progress((i + 1) / total)
+            
+            # Removed time.sleep(0.7) as the Shodan CVEDB API does not have the same rate limits as NVD, 
+            # and excessive sleep slows down the Streamlit UI.
+
+        if rows:
+            with sqlite3.connect(DB_NAME) as conn:
+                #  Added 'severity' to the insert query to match DB schema
+                conn.executemany(
+                    "INSERT INTO cve_data (org, ip, cve_id, score, severity, timestamp) VALUES (?,?,?,?,?,?)", 
+                    rows
+                )
+        return len(rows)
+
+# ===========================
+# Dashboard Logic
+# ===========================
+class Dashboard:
+    def load_data(self):
+        with sqlite3.connect(DB_NAME) as conn:
+            return pd.read_sql("SELECT org, ip, cve_id, score, severity, timestamp FROM cve_data ORDER BY score DESC", conn)
+
+    def render(self):
+        st.set_page_config(page_title="MY CVE Monitor", layout="wide")
+        st.title("Malaysia CVE Monitoring Dashboard")
+
+        # --- Sidebar Controls ---
+        st.sidebar.header("Scan Settings")
+        api_key = st.sidebar.text_input("Shodan API Key", type="password")
+        query = st.sidebar.text_input("Shodan Query", "country:MY has_vuln:true")
+
+        if st.sidebar.button("Run Live Scan"):
+            if not api_key: st.sidebar.error("API Key is required!")
+            else:
+                scanner = Scanner(api_key)
+                bar = st.sidebar.progress(0.0)
+                with st.spinner("Analyzing vulnerabilities..."):
+                    count = scanner.scan(query, progress=bar.progress)
+                st.sidebar.success(f"Added {count} records!")
+                st.rerun()
+
+        # --- Data Visualization ---
+        df = self.load_data()
+        if df.empty:
+            st.info("Database is empty. Please run a scan from the sidebar.")
+            return
+
+        st.subheader("Vulnerability Severity Ranking by Organization")
+        
+        # Aggregate data for Chart
+        chart_df = df.groupby(['org', 'severity']).size().reset_index(name='Count')
+        
+        # Horizontal Bar Chart with Interaction
+        fig = px.bar(
+            chart_df, x="Count", y="org", color="severity",
+            orientation='h', title="Click a bar to filter the details below",
+            color_discrete_map={'CRITICAL':'#d32f2f', 'HIGH':'#f57c00', 'MEDIUM':'#fbc02d', 'LOW':'#388e3c', 'UNKNOWN': '#757575'}
+        )
+        
+        # Enable Selection/Drill-down
+        # 
+        event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="org_chart")
+
+        # Logic for Drill-down filter
+        selected_org = None
+        if event and 'selection' in event and event['selection']['points']:
+            selected_org = event['selection']['points'][0]['y']
+
+        # --- Detail Table ---
+        st.divider()
+        st.subheader(f"Details for: {selected_org if selected_org else 'All Organizations'}")
+        
+        display_df = df[df['org'] == selected_org].copy() if selected_org else df.copy()
+        
+        # Add NVD Hyperlink logic
+        display_df['NVD_Link'] = display_df['cve_id'].apply(lambda x: f"https://nvd.nist.gov/vuln/detail/{x}")
+
+        st.dataframe(
+            display_df[['org', 'ip', 'cve_id', 'score', 'severity', 'NVD_Link', 'timestamp']],
+            column_config={
+                "NVD_Link": st.column_config.LinkColumn("Deep Dive", display_text="Open NIST Info"),
+                "timestamp": st.column_config.DatetimeColumn("Last Seen", format="YYYY-MM-DD HH:mm:ss")
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+
+# ===========================
+# Entry Point
+# ===========================
+if __name__ == "__main__":
+    Dashboard().render()
