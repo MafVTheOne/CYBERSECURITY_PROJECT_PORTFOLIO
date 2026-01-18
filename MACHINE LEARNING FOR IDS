@@ -1,0 +1,103 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sdv.metadata import SingleTableMetadata
+from sdv.single_table import GaussianCopulaSynthesizer
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, precision_score, f1_score
+
+# Data preparation
+print("1. Loading DDoS Data...")
+df = pd.read_csv("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv")
+df.columns = df.columns.str.strip()
+
+# Clean the file
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+df.dropna(inplace=True)
+
+# Remove non-predictive columns (IPs, Ports, Timestamps) so the model learns behavior, not specific addresses
+cols_to_drop = ['Flow ID', 'Source IP', 'Source Port', 'Destination IP', 'Timestamp']
+df = df.drop(columns=cols_to_drop, errors='ignore')
+
+# Encode Labels: 0 = Benign, 1 = Attack
+df['Label'] = df['Label'].apply(lambda x: 0 if x == 'BENIGN' else 1)
+
+# Split 70/30
+# X_train is used to teach the Synthesizer. X_test is locked away for the final exam.
+print("   Splitting data (70% Train / 30% Test)...")
+X = df.drop('Label', axis=1)
+y = df['Label']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+# Combine X and y because SDV needs a full table to learn correlations
+train_data = pd.concat([X_train, y_train], axis=1)
+
+# Train Synthesizer using Gaussian Copula
+print("\n2. Initializing Gaussian Copula (Statistical Model)...")
+metadata = SingleTableMetadata()
+metadata.detect_from_dataframe(train_data)
+
+synthesizer = GaussianCopulaSynthesizer(metadata)
+
+print("   Fitting Synthesizer (This takes seconds)...")
+synthesizer.fit(train_data)
+
+print("   Generating synthetic data...")
+# Create a brand new dataset with the same size as the original
+synthetic_data = synthesizer.sample(num_rows=len(train_data))
+
+# Separate the Synthetic Data
+X_train_fake = synthetic_data.drop('Label', axis=1)
+y_train_fake = synthetic_data['Label']
+
+# Train classifiers on synthetic data
+models = {
+    "Decision Tree (Copula-Trained)": DecisionTreeClassifier(random_state=42),
+    "Random Forest (Copula-Trained)": RandomForestClassifier(n_estimators=100, random_state=42)
+}
+
+results = []
+
+print(f"\n3. Training Models on SYNTHETIC data...")
+for name, model in models.items():
+    print(f"   Training {name}...")
+    # Fit on FAKE data, but we predict on REAL data (X_test)
+    model.fit(X_train_fake, y_train_fake)
+    
+    # Test on Real Data
+    y_pred = model.predict(X_test)
+    
+    # Store Stats
+    results.append({
+        "Model": name,
+        "Accuracy": accuracy_score(y_test, y_pred),
+        "Precision": precision_score(y_test, y_pred),
+        "Recall": recall_score(y_test, y_pred),
+        "F1": f1_score(y_test, y_pred),
+        "CM": confusion_matrix(y_test, y_pred)
+    })
+
+# Evaluation and Visualization
+print("\n" + "="*80)
+print(f"{'SYNTHETIC DATA EXPERIMENT RESULTS':^80}")
+print("="*80)
+print(f"{'Model':<30} | {'Accuracy':<10} | {'Recall':<10} | {'F1-Score':<10}")
+print("-" * 80)
+for res in results:
+    print(f"{res['Model']:<30} | {res['Accuracy']:.4f}     | {res['Recall']:.4f}     | {res['F1']:.4f}")
+print("-" * 80)
+
+# Save Confusion Matrix Plot
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+for i, res in enumerate(results):
+    sns.heatmap(res['CM'], annot=True, fmt='d', cmap='Blues', ax=axes[i])
+    axes[i].set_title(f"{res['Model']}\nTested on Real Data\nF1 Score: {res['F1']:.4f}")
+    axes[i].set_xlabel("Predicted Label")
+    axes[i].set_ylabel("Actual Label")
+
+plt.tight_layout()
+plt.savefig("copula_ddos_results.png")
+print("\nSUCCESS: Saved visualization to 'copula_ddos_results.png'")
