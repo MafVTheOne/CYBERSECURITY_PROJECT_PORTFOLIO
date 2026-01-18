@@ -1,1 +1,270 @@
+"""Reconnaissance Module using Scapy and Shodan API"""
+
+import json
+import logging
+import socket
+from datetime import datetime
+from scapy.all import IP, TCP, UDP, ICMP, sr1, sr
+import shodan
+
+# Configure logging for clarity
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [RECON] - %(levelname)s - %(message)s'
+)
+
+class Recon:
+ 
+
+    def __init__(self, target_ip, shodan_api_key=None, ports_to_scan=None, scan_udp=True):
+        
+        self.target_ip = target_ip
+        self.shodan_api_key = shodan_api_key
+        self.scan_udp = scan_udp
+        self.results = {
+            "target": target_ip,
+            "scan_timestamp": None,
+            "services": []
+        }
+        
+        # Default to a standard list of interesting ports if none provided
+        self.ports = ports_to_scan if ports_to_scan else [
+            21, 22, 23, 25, 53, 80, 110, 139, 143, 443, 
+            445, 3306, 3389, 5900, 8080, 8443
+        ]
+        
+        # Common UDP ports to scan
+        self.udp_ports = [53, 67, 68, 69, 123, 161, 162, 514, 1900]
+
+    def _tcp_syn_scan(self, port):
+       
+        try:
+            # Craft SYN packet
+            syn_packet = IP(dst=self.target_ip)/TCP(dport=port, flags='S')
+            
+            # Send packet and wait for response
+            response = sr1(syn_packet, timeout=2, verbose=0)
+            
+            if response is None:
+                return "Filtered", None
+            
+            # Check response flags
+            if response.haslayer(TCP):
+                if response[TCP].flags == 0x12:  # SYN-ACK
+                    # Send RST to close connection gracefully
+                    rst_packet = IP(dst=self.target_ip)/TCP(dport=port, flags='R')
+                    sr1(rst_packet, timeout=1, verbose=0)
+                    return "Open", response
+                elif response[TCP].flags == 0x14:  # RST-ACK
+                    return "Closed", response
+            
+            return "Filtered", response
+            
+        except Exception as e:
+            logging.debug(f"TCP scan error on port {port}: {e}")
+            return "Error", None
+
+    def _udp_scan(self, port):
+       
+        try:
+            # Craft UDP packet with empty payload
+            udp_packet = IP(dst=self.target_ip)/UDP(dport=port)
+            
+            # Send and wait for response
+            response = sr1(udp_packet, timeout=2, verbose=0)
+            
+            if response is None:
+                # No response - could be open or filtered
+                return "Open|Filtered", None
+            
+            # Check for ICMP unreachable
+            if response.haslayer(ICMP):
+                if int(response[ICMP].type) == 3 and int(response[ICMP].code) == 3:
+                    return "Closed", response
+            
+            # Got a UDP response - port is open
+            if response.haslayer(UDP):
+                return "Open", response
+            
+            return "Open|Filtered", response
+            
+        except Exception as e:
+            logging.debug(f"UDP scan error on port {port}: {e}")
+            return "Error", None
+
+    def _grab_banner_socket(self, port):
+        
+        banner = "Unknown"
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1.5)
+                s.connect((self.target_ip, port))
+                
+                # Protocol specific nudges
+                if port in [80, 443, 8080, 8443]:
+                    s.send(b'HEAD / HTTP/1.0\r\n\r\n')
+                elif port == 21: 
+                    pass  # FTP sends banner automatically
+                elif port == 22: 
+                    pass  # SSH sends banner automatically
+                elif port == 25:  
+                    pass  # SMTP sends banner automatically
+                
+                # Receive response
+                try:
+                    data = s.recv(1024)
+                    if data:
+                        decoded = data.decode('utf-8', errors='ignore').strip()
+                        # Take only the first line to keep it clean
+                        banner = decoded.split('\n')[0][:80]
+                except socket.timeout:
+                    pass
+                    
+        except Exception:
+            pass
+            
+        return banner
+
+    def scan_target(self):
+       
+        logging.info(f"Starting Scapy-based scan on target: {self.target_ip}")
+        self.results["scan_timestamp"] = datetime.now().isoformat()
+        
+        # TCP Scanning
+        logging.info(f"Scanning {len(self.ports)} TCP ports...")
+        for port in self.ports:
+            state, response = self._tcp_syn_scan(port)
+            
+            if state == "Open":
+                service_record = {
+                    "port": port,
+                    "protocol": "TCP",
+                    "state": state,
+                    "service_version": "Unknown",
+                    "risk_assessment": "Unverified/Potential Risk"
+                }
+                
+                # Attempt banner grabbing for version detection
+                banner = self._grab_banner_socket(port)
+                if banner != "Unknown":
+                    service_record["service_version"] = banner
+                
+                logging.info(f"Found Open TCP Port: {port} | Version: {service_record['service_version']}")
+                self.results["services"].append(service_record)
+        
+        # UDP Scanning (if enabled)
+        if self.scan_udp:
+            logging.info(f"Scanning {len(self.udp_ports)} UDP ports...")
+            for port in self.udp_ports:
+                state, response = self._udp_scan(port)
+                
+                if state in ["Open", "Open|Filtered"]:
+                    service_record = {
+                        "port": port,
+                        "protocol": "UDP",
+                        "state": state,
+                        "service_version": "Unknown",
+                        "risk_assessment": "Unverified/Potential Risk"
+                    }
+                    
+                    logging.info(f"Found {state} UDP Port: {port}")
+                    self.results["services"].append(service_record)
+
+    def enrich_threat_intel(self):
+        
+        if not self.results["services"]:
+            logging.info("No open services to enrich.")
+            return
+
+        if not self.shodan_api_key:
+            logging.warning("No Shodan API key provided. Skipping enrichment phase.")
+            return
+
+        logging.info("Querying Shodan API for enrichment...")
+        
+        try:
+            api = shodan.Shodan(self.shodan_api_key)
+            # Fetch host data once to save API credits
+            host_data = api.host(self.target_ip)
+            
+            for local_service in self.results["services"]:
+                # Match local port to Shodan data (checking both port and protocol)
+                shodan_match = next(
+                    (item for item in host_data.get('data', []) 
+                     if item['port'] == local_service['port'] and 
+                        item['transport'] == local_service['protocol'].lower()), 
+                    None
+                )
+                
+                if shodan_match:
+                    # Update Version if ours was generic
+                    if local_service["service_version"] == "Unknown":
+                        product = shodan_match.get('product', '')
+                        version = shodan_match.get('version', '')
+                        local_service["service_version"] = f"{product} {version}".strip() or 'Detected via Shodan'
+
+                    # Risk Assessment Logic
+                    vulns = host_data.get('vulns', [])
+                    if vulns:
+                        local_service["risk_assessment"] = f"HIGH RISK ({len(vulns)} CVEs detected)"
+                    else:
+                        local_service["risk_assessment"] = "Verified Service (No known CVEs)"
+                else:
+                    # Graceful handling: No public data exists for this specific service
+                    local_service["risk_assessment"] = "Unverified/Potential Risk"
+
+        except shodan.APIError as e:
+            logging.error(f"Shodan API Error: {e}")
+            # Maintain default risk tags on API failure
+            for s in self.results["services"]:
+                if "Unverified" in s["risk_assessment"]:
+                    s["risk_assessment"] = "Unverified (API Error)"
+                    
+        except Exception as e:
+            logging.error(f"General Enrichment Error: {e}")
+
+    def export_results(self, filename="network_context.json"):
+      
+        try:
+            with open(filename, 'w') as f:
+                json.dump(self.results, f, indent=4)
+            logging.info(f"Reconnaissance completed. Context saved to {filename}")
+            return True
+        except IOError as e:
+            logging.error(f"Failed to write output file: {e}")
+            return False
+
+    def execute_recon(self, output_file="network_context.json"):
+        
+        # Step 1: Discover services
+        self.scan_target()
+        
+        # Step 2: Enrich with threat intelligence
+        self.enrich_threat_intel()
+        
+        # Step 3: Export results
+        self.export_results(output_file)
+        
+        return self.results
+
+# Execution Block for Testing 
+if __name__ == "__main__":
+    
+    TARGET_IP = "None" #Insert your Target IP
+    
+   
+    recon = Recon(
+        TARGET_IP, 
+        shodan_api_key="None", #Insert your API key for shodan 
+        scan_udp=True  # Enable UDP scanning
+    )
+    
+    # Execute complete reconnaissance workflow
+    results = recon.execute_recon()
+    
+    # Display summary
+    print(f"Reconnaissance Complete for {TARGET_IP}")
+    print(f"Total Services Found: {len(results['services'])}")
+    print(f"Output saved to: network_context.json")
+
 
